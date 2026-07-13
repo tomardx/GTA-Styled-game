@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEON RUSH — open-world stunt motorcycle</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0512; }
+  body { font-family: 'Segoe UI', 'Arial', sans-serif; user-select: none; }
+  canvas#c3d { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  canvas#fx { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
+
+  /* vignette */
+  #vig { position: fixed; inset: 0; pointer-events: none; z-index: 1;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(5,0,15,0.55) 100%); }
+
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 3; }
+
+  #scorebox { position: absolute; top: 18px; left: 22px; }
+  #score { font-size: 42px; font-weight: 900; font-style: italic; color: #fff;
+    text-shadow: 0 0 14px #ff2d95, 0 0 42px rgba(255,45,149,.6); letter-spacing: 1px; }
+  #best { font-size: 13px; font-weight: 700; color: #b98ad0; letter-spacing: 3px; margin-top: 2px; }
+  #combo { display: none; margin-top: 10px; }
+  #combo span { font-size: 26px; font-weight: 900; font-style: italic; color: #ffe14d;
+    text-shadow: 0 0 12px #ff9a00, 0 0 30px rgba(255,154,0,.7); }
+  #combowrap { width: 130px; height: 5px; background: rgba(255,255,255,.12); border-radius: 3px; margin-top: 4px; }
+  #combobar { height: 100%; background: linear-gradient(90deg, #ffe14d, #ff9a00); border-radius: 3px; width: 100%; }
+
+  #map { position: absolute; top: 18px; right: 22px; border-radius: 10px;
+    box-shadow: 0 0 0 2px rgba(255,45,149,.35), 0 0 24px rgba(255,45,149,.25); opacity: .92; }
+
+  #speedo { position: absolute; right: 26px; bottom: 24px; text-align: right; }
+  #spd { font-size: 74px; font-weight: 900; font-style: italic; color: #fff; line-height: .9;
+    text-shadow: 0 0 16px #00e5ff, 0 0 50px rgba(0,229,255,.55); font-variant-numeric: tabular-nums; }
+  #speedo .unit { font-size: 16px; font-weight: 800; color: #7fdcff; letter-spacing: 4px; margin-left: 6px; }
+  #boostwrap { width: 240px; height: 12px; margin-top: 10px; border-radius: 7px;
+    background: rgba(255,255,255,.1); box-shadow: inset 0 0 6px rgba(0,0,0,.6); overflow: hidden; }
+  #boostbar { height: 100%; width: 60%; border-radius: 7px;
+    background: linear-gradient(90deg, #ff2d95, #b967ff, #00e5ff);
+    transition: width .08s linear; }
+  #boostbar.active { filter: brightness(1.6); }
+  #boostbar.full { animation: pulse .5s infinite alternate; }
+  @keyframes pulse { from { filter: brightness(1); } to { filter: brightness(1.9); } }
+  #boostlabel { font-size: 11px; font-weight: 800; color: #c88ae0; letter-spacing: 4px; margin-top: 5px; }
+
+  #popups { position: absolute; left: 50%; top: 30%; transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .pop { font-size: 30px; font-weight: 900; font-style: italic; letter-spacing: 2px;
+    animation: popin 1.1s ease-out forwards; white-space: nowrap; }
+  .pop.big { font-size: 44px; }
+  @keyframes popin {
+    0% { transform: scale(.4); opacity: 0; }
+    12% { transform: scale(1.18); opacity: 1; }
+    22% { transform: scale(1); }
+    75% { opacity: 1; transform: scale(1) translateY(-6px); }
+    100% { opacity: 0; transform: scale(.92) translateY(-26px); }
+  }
+
+  #hint { position: absolute; left: 22px; bottom: 22px; font-size: 12.5px; font-weight: 600;
+    color: rgba(255,255,255,.55); letter-spacing: 1px; line-height: 1.8;
+    opacity: 0; transition: opacity 1s; }
+  #hint.show { opacity: 1; }
+  #hint b { color: #7fdcff; }
+
+  /* ---- title / pause overlay ---- */
+  #overlay { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; cursor: pointer;
+    background: radial-gradient(ellipse at 50% 60%, rgba(20,5,40,.5), rgba(8,2,18,.88));
+    transition: opacity .6s; }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #ovtitle { font-size: clamp(54px, 11vw, 130px); font-weight: 900; font-style: italic;
+    letter-spacing: 4px; line-height: 1;
+    background: linear-gradient(180deg, #fff 15%, #ff9df0 45%, #ff2d95 70%, #7a1a8a 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    filter: drop-shadow(0 0 24px rgba(255,45,149,.75)) drop-shadow(0 0 90px rgba(255,45,149,.4));
+    animation: titleglow 2.4s ease-in-out infinite alternate; }
+  @keyframes titleglow {
+    from { filter: drop-shadow(0 0 18px rgba(255,45,149,.6)) drop-shadow(0 0 70px rgba(255,45,149,.3)); }
+    to { filter: drop-shadow(0 0 30px rgba(255,45,149,.95)) drop-shadow(0 0 110px rgba(0,229,255,.45)); }
+  }
+  #ovtag { margin-top: 6px; font-size: clamp(12px, 2vw, 17px); font-weight: 700; letter-spacing: 8px;
+    color: #6fe3ff; text-shadow: 0 0 14px rgba(0,229,255,.8); }
+  #controls { margin-top: 42px; display: grid; grid-template-columns: auto auto; gap: 9px 26px;
+    font-size: 14.5px; font-weight: 600; color: rgba(255,255,255,.85); letter-spacing: 1px; }
+  #controls .k { text-align: right; color: #ffe14d; font-weight: 800;
+    text-shadow: 0 0 10px rgba(255,225,77,.5); }
+  #ovsub { margin-top: 44px; font-size: 17px; font-weight: 800; letter-spacing: 5px; color: #fff;
+    text-shadow: 0 0 16px #ff2d95; animation: blink 1.2s infinite; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  #ovsub b { color: #ffe14d; }
+  #ovfoot { position: absolute; bottom: 18px; font-size: 11.5px; letter-spacing: 2px;
+    color: rgba(255,255,255,.35); }
+</style>
+</head>
+<body>
+<canvas id="c3d"></canvas>
+<div id="vig"></div>
+<canvas id="fx"></canvas>
+
+<div id="hud">
+  <div id="scorebox">
+    <div id="score">0</div>
+    <div id="best">BEST 0</div>
+    <div id="combo"><span>x2 COMBO</span><div id="combowrap"><div id="combobar"></div></div></div>
+  </div>
+  <canvas id="map" width="170" height="170"></canvas>
+  <div id="speedo">
+    <span id="spd">0</span><span class="unit">KM/H</span>
+    <div id="boostwrap"><div id="boostbar"></div></div>
+    <div id="boostlabel">NITRO — DRIFT &amp; STUNT TO REFILL</div>
+  </div>
+  <div id="popups"></div>
+  <div id="hint">
+    <b>W A S D</b> ride &nbsp;·&nbsp; <b>SHIFT</b> nitro &nbsp;·&nbsp; <b>SPACE</b> bunny hop<br>
+    <b>Q / E</b> hold to drift — release for boost &nbsp;·&nbsp; <b>Q / E in air</b> spin tricks<br>
+    hit ramps · thread rings · graze traffic · chain combos
+  </div>
+</div>
+
+<div id="overlay">
+  <div id="ovtitle">NEON RUSH</div>
+  <div id="ovtag">AN OPEN-WORLD STUNT RIDE</div>
+  <div id="controls">
+    <div class="k">W / S</div><div>throttle &amp; brake</div>
+    <div class="k">A / D</div><div>steer</div>
+    <div class="k">SHIFT</div><div>nitro boost</div>
+    <div class="k">SPACE</div><div>bunny hop</div>
+    <div class="k">Q / E</div><div>drift (hold &amp; release) — spin tricks in the air</div>
+  </div>
+  <div id="ovsub">CLICK OR PRESS <b>ENTER</b> TO RIDE</div>
+  <div id="ovfoot">M — mute &nbsp;·&nbsp; R — reset bike &nbsp;·&nbsp; ESC — pause</div>
+</div>
+
+<script src="three.min.js"></script>
+<script src="world.js"></script>
+<script src="game.js"></script>
+</body>
+</html>
