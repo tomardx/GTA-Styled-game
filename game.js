@@ -351,6 +351,7 @@ let carBodies, carCabins, carLights;
       sign: rng() < 0.5 ? 1 : -1,
       s: R(-HALF + 20, HALF - 20),
       speed: R(11, 19), nm: 0,
+      spin: 0, spinA: 0, scr: 0, swerve: 0,
       color: pick(CAR_COLORS),
     });
   }
@@ -385,13 +386,30 @@ const liteOffsets = [
 const tmpM = new THREE.Matrix4(), tmpM2 = new THREE.Matrix4(), tmpV = new THREE.Vector3();
 function updateTraffic(dt) {
   cars.forEach((car, i) => {
-    car.s += car.speed * car.sign * dt;
+    // perk effects: spin-outs stop the car and twirl it; scramble makes it swerve
+    let speedK = 1;
+    if (car.spin > 0) {
+      car.spin -= dt;
+      car.spinA += dt * 7 * Math.min(1, car.spin + 0.3);
+      speedK = 0.12;
+    } else if (Math.abs(car.spinA % TAU) > 0.05) {
+      car.spinA = lerp(car.spinA, Math.round(car.spinA / TAU) * TAU, 1 - Math.exp(-4 * dt));
+    }
+    if (car.scr > 0) {
+      car.scr -= dt;
+      car.swerve = Math.sin(elapsed * 9 + i * 1.7) * 2.4;
+      speedK = Math.min(speedK, 0.6);
+    } else {
+      car.swerve *= Math.max(0, 1 - 3 * dt);
+    }
+    car.s += car.speed * car.sign * dt * speedK;
     if (car.s > HALF - 6) car.s = -HALF + 6;
     if (car.s < -HALF + 6) car.s = HALF - 6;
     if (car.nm > 0) car.nm -= dt;
     let x, z, yaw;
-    if (car.axis === 'x') { x = car.s; z = car.road - 5.2 * car.sign; yaw = car.sign > 0 ? Math.PI / 2 : -Math.PI / 2; }
-    else { x = car.road - 5.2 * car.sign; z = car.s; yaw = car.sign > 0 ? 0 : Math.PI; }
+    if (car.axis === 'x') { x = car.s; z = car.road - 5.2 * car.sign + car.swerve; yaw = car.sign > 0 ? Math.PI / 2 : -Math.PI / 2; }
+    else { x = car.road - 5.2 * car.sign + car.swerve; z = car.s; yaw = car.sign > 0 ? 0 : Math.PI; }
+    yaw += car.spinA;
     car.x = x; car.z = z;
     car.hx = car.axis === 'x' ? 2.5 : 1.15;
     car.hz = car.axis === 'x' ? 1.15 : 2.5;
@@ -411,6 +429,497 @@ function updateTraffic(dt) {
   carBodies.instanceMatrix.needsUpdate = true;
   carCabins.instanceMatrix.needsUpdate = true;
   carLights.instanceMatrix.needsUpdate = true;
+}
+
+/* ================= PERKS ================= */
+const PERKS = {
+  overdrive: { name: 'NITRO OVERDRIVE', color: 0xbffcff, css: '#bffcff', glyph: '⚡' },
+  slick:     { name: 'OIL SLICK',       color: 0x8a3cff, css: '#a86aff', glyph: '◉' },
+  emp:       { name: 'EMP PULSE',       color: 0x2e9bff, css: '#2e9bff', glyph: '⌁' },
+  flare:     { name: 'HOMING FLARE',    color: 0xff8a2a, css: '#ff8a2a', glyph: '➤' },
+  shield:    { name: 'PHASE SHIELD',    color: 0xffd84d, css: '#ffd84d', glyph: '◈' },
+  magnet:    { name: 'MAGNET YANK',     color: 0xff3cd2, css: '#ff3cd2', glyph: '∪' },
+  dash:      { name: 'GHOST DASH',      color: 0x3cffc8, css: '#3cffc8', glyph: '≫' },
+};
+const PERK_KINDS = Object.keys(PERKS);
+var P = {
+  held: null, fireCd: 0,
+  odT: 0, odK: 0, shieldT: 0, dashI: 0,
+  magT: 0, magTarget: null, scrT: 0,
+};
+var fxFlash = { r: 0, g: 0, b: 0, a: 0 };
+
+/* ---- perk orbs (instanced, color = perk) ---- */
+const PERK_ORB_N = 26;
+const perkOrbs = [];
+(() => {
+  for (let i = 0; i < PERK_ORB_N; i++) {
+    const axis = rng() < 0.5 ? 'x' : 'z';
+    const k = Math.floor(R(1, GRID));
+    const roadC = -HALF + k * CELL;
+    const along = R(-HALF + 60, HALF - 60);
+    const lane = R(-5, 5);
+    perkOrbs.push({
+      x: axis === 'x' ? along : roadC + lane,
+      z: axis === 'x' ? roadC + lane : along,
+      y: 1.5, kind: pick(PERK_KINDS), active: true, respawn: 0, phase: R(0, TAU),
+    });
+  }
+})();
+const perkOrbMesh = (() => {
+  const geo = new THREE.OctahedronGeometry(0.85, 0);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const mesh = new THREE.InstancedMesh(geo, mat, PERK_ORB_N);
+  const c = new THREE.Color();
+  perkOrbs.forEach((o, i) => { c.setHex(PERKS[o.kind].color); mesh.setColorAt(i, c); });
+  scene.add(mesh);
+  return mesh;
+})();
+const perkOrbGlow = (() => {
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(PERK_ORB_N * 3);
+  const col = new Float32Array(PERK_ORB_N * 3);
+  const size = new Float32Array(PERK_ORB_N);
+  const alpha = new Float32Array(PERK_ORB_N);
+  const c = new THREE.Color();
+  perkOrbs.forEach((o, i) => {
+    pos.set([o.x, o.y, o.z], i * 3);
+    c.setHex(PERKS[o.kind].color);
+    col.set([c.r, c.g, c.b], i * 3);
+    size[i] = 6; alpha[i] = 0.6;
+  });
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  geo.setAttribute('aAlpha', new THREE.BufferAttribute(alpha, 1));
+  const mat = makePointsMaterial(glowTex);
+  glowMaterials.push(mat);
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false;
+  scene.add(pts);
+  return pts;
+})();
+function relocatePerkOrb(o) {
+  o.kind = PERK_KINDS[Math.floor(Math.random() * PERK_KINDS.length)];
+  // bias spawns toward race routes once they exist
+  if (window.Race && Math.random() < 0.6) {
+    const p = Race.randomRoutePoint();
+    if (p) { o.x = p.x; o.z = p.z; return; }
+  }
+  const axis = Math.random() < 0.5 ? 'x' : 'z';
+  const k = Math.floor(1 + Math.random() * (GRID - 1));
+  const roadC = -HALF + k * CELL;
+  const along = -HALF + 60 + Math.random() * (WORLD - 120);
+  const lane = -5 + Math.random() * 10;
+  o.x = axis === 'x' ? along : roadC + lane;
+  o.z = axis === 'x' ? roadC + lane : along;
+}
+
+/* ---- hazards: oil slicks ---- */
+const SLICK_MAX = 24;
+const slicks = [];   // {x,z,life,age,owner}
+const slickMesh = (() => {
+  const geo = new THREE.CircleGeometry(2.3, 14);
+  geo.rotateX(-Math.PI / 2);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x07070d, roughness: 0.12, metalness: 0.85,
+    emissive: 0x30104a, emissiveIntensity: 0.7,
+  });
+  const m = new THREE.InstancedMesh(geo, mat, SLICK_MAX);
+  scene.add(m);
+  return m;
+})();
+function dropSlickAt(x, z, owner) {
+  if (slicks.length >= SLICK_MAX) slicks.shift();
+  slicks.push({ x, z, life: 22, age: 0, owner });
+}
+function getSlicks() { return slicks; }
+
+/* ---- hazards: homing flares ---- */
+const flares = [];   // {x,y,z,ang,target,life,owner}
+function spawnFlare(x, y, z, ang, target, owner) {
+  flares.push({ x, y, z, ang, target, life: 3.2, owner });
+  Audio2.beep(1300, 620, 0.3, 'sawtooth', 0.2);
+}
+
+/* ---- EMP ring visual ---- */
+const empFx = (() => {
+  const mesh = new THREE.Mesh(
+    new THREE.TorusGeometry(1, 0.14, 8, 40),
+    new THREE.MeshBasicMaterial({ color: 0x66ccff, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false })
+  );
+  mesh.rotation.x = Math.PI / 2;
+  mesh.visible = false;
+  scene.add(mesh);
+  return { mesh, t: 99 };
+})();
+
+/* ---- shield bubble ---- */
+const shieldMesh = (() => {
+  const m = new THREE.Mesh(
+    new THREE.SphereGeometry(1.55, 18, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffd84d, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false })
+  );
+  m.position.y = 0.7; m.visible = false;
+  bikeGroup.add(m);
+  return m;
+})();
+
+/* ---- magnet tether ---- */
+const tether = (() => {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xff3cd2, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending }));
+  line.frustumCulled = false; line.visible = false;
+  scene.add(line);
+  return line;
+})();
+
+/* ---- player as a perk victim ---- */
+function playerShielded() { return P.shieldT > 0 || P.dashI > 0; }
+const playerTarget = {
+  get x() { return B.x; }, get z() { return B.z; },
+  kind: 'player',
+  shielded: playerShielded,
+  stun(s) { playerStun(s); },
+  scramble(s) { playerScramble(s); },
+  spinOut() { playerOiled(); },
+  steal(f) { return playerSteal(f); },
+};
+function playerScramble(s) {
+  if (playerShielded()) return;
+  P.scrT = Math.max(P.scrT, s);
+  fxFlash = { r: 80, g: 160, b: 255, a: 0.4 };
+  popup('SCRAMBLED!', '#2e9bff', false);
+  Audio2.beep(300, 90, 0.4, 'square', 0.2);
+}
+function playerStun(s) {
+  if (playerShielded()) return;
+  B.speed *= 0.35; B.wobble = 1;
+  B.lowGrip = Math.max(B.lowGrip, s);
+  shakeT = Math.max(shakeT, 0.5);
+  fxFlash = { r: 255, g: 140, b: 40, a: 0.45 };
+  popup('FLARE HIT', '#ff8a2a', true);
+  breakCombo();
+  Audio2.crash(0.5);
+}
+function playerSteal(f) {
+  if (playerShielded()) return 0;
+  const st = Math.max(0, B.speed) * f;
+  B.speed -= st;
+  popup('SPEED DRAINED', '#ff3cd2', false);
+  return st;
+}
+function playerOiled() {
+  if (playerShielded() || B.lowGrip > 0.6) return;
+  B.lowGrip = Math.max(B.lowGrip, 1.0);
+  B.leanV += (Math.random() < 0.5 ? -1 : 1) * 1.8;
+  popup('OIL!', '#b06aff', false);
+  Audio2.beep(200, 60, 0.3, 'sawtooth', 0.18);
+}
+
+/* ---- targets ---- */
+function carTarget(c) {
+  return {
+    get x() { return c.x || 0; }, get z() { return c.z || 0; },
+    kind: 'car',
+    shielded: () => false,
+    stun() { c.spin = Math.max(c.spin || 0, 1.3); },
+    scramble(s) { c.scr = Math.max(c.scr || 0, s); },
+    spinOut() { c.spin = Math.max(c.spin || 0, 1.6); },
+    steal() { const st = c.speed * 0.35; c.speed -= st; return st; },
+  };
+}
+function getPerkTargets() {
+  const t = [];
+  if (window.Race) for (const r of Race.getTargets()) t.push(r);
+  for (const c of cars) t.push(carTarget(c));
+  return t;
+}
+function nearestTargetAhead(maxDist, maxAng) {
+  let bestT = null, bestD = maxDist;
+  for (const t of getPerkTargets()) {
+    const dx = t.x - B.x, dz = t.z - B.z;
+    const d = Math.hypot(dx, dz);
+    if (d > bestD || d < 2) continue;
+    if (Math.abs(angleDiff(Math.atan2(dx, dz), B.bikeYaw)) > maxAng) continue;
+    bestT = t; bestD = d;
+  }
+  return bestT;
+}
+
+/* ---- EMP (usable by player and rivals) ---- */
+function fireEMPfrom(x, z, ang, exclude) {
+  empFx.mesh.position.set(x, 1, z);
+  empFx.mesh.scale.setScalar(0.01);
+  empFx.mesh.visible = true;
+  empFx.t = 0;
+  const all = getPerkTargets();
+  all.push(playerTarget);
+  for (const t of all) {
+    if (t === exclude || (exclude && t.kind === 'player' && exclude.kind === 'player')) continue;
+    const dx = t.x - x, dz = t.z - z;
+    const d = Math.hypot(dx, dz);
+    if (d < 2 || d > 35) continue;
+    if (Math.abs(angleDiff(Math.atan2(dx, dz), ang)) > 0.55) continue;
+    if (t.shielded && t.shielded()) continue;
+    t.scramble(2);
+  }
+  Audio2.beep(1800, 200, 0.4, 'square', 0.22);
+}
+
+/* ---- firing ---- */
+function tryDash() {
+  const dirX = Math.sin(B.bikeYaw), dirZ = Math.cos(B.bikeYaw);
+  for (let d = 18; d >= 6; d -= 2) {
+    const nx = B.x + dirX * d, nz = B.z + dirZ * d;
+    if (Math.abs(nx) > HALF - 2 || Math.abs(nz) > HALF - 2) continue;
+    let blocked = false;
+    for (const b of getCollidersNear(nx, nz)) {
+      if (B.y < b.h - 0.6 && nx > b.x0 - 1 && nx < b.x1 + 1 && nz > b.z0 - 1 && nz < b.z1 + 1) { blocked = true; break; }
+    }
+    if (blocked) continue;
+    for (let i = 0; i < 12; i++) {
+      PSYS.spawn(B.x + dirX * d * i / 12, B.y + 0.3 + Math.random() * 0.8, B.z + dirZ * d * i / 12,
+        R(-1, 1), R(0, 1.5), R(-1, 1), R(0.3, 0.5), R(0.4, 0.7), 1.5, 0.24, 1.0, 0.78, 0.85, 0);
+    }
+    B.x = nx; B.z = nz;
+    B.safeT = Math.max(B.safeT, 0.4);
+    P.dashI = 0.35;
+    shakeT = Math.max(shakeT, 0.18);
+    Audio2.beep(500, 1900, 0.16, 'triangle', 0.24);
+    return true;
+  }
+  return false;
+}
+function firePerk() {
+  if (!P.held || P.fireCd > 0 || gameState !== 'play' || B.crashT > 0) return;
+  const kind = P.held;
+  let consumed = true;
+  if (kind === 'overdrive') {
+    P.odT = 4;
+    fxFlash = { r: 190, g: 250, b: 255, a: 0.4 };
+    popup('OVERDRIVE!', PERKS.overdrive.css, true);
+    Audio2.beep(220, 1400, 0.5, 'sawtooth', 0.25);
+  } else if (kind === 'slick') {
+    P.slickDrops = 3; P.slickTimer = 0;
+    popup('OIL SLICK', PERKS.slick.css, false);
+  } else if (kind === 'emp') {
+    fireEMPfrom(B.x, B.z, B.bikeYaw, playerTarget);
+    fxFlash = { r: 60, g: 150, b: 255, a: 0.35 };
+    popup('EMP PULSE', PERKS.emp.css, false);
+  } else if (kind === 'flare') {
+    const t = nearestTargetAhead(85, 1.0);
+    spawnFlare(B.x, B.y + 1.2, B.z, B.bikeYaw, t, playerTarget);
+    popup(t ? 'FLARE LOCKED' : 'FLARE AWAY', PERKS.flare.css, false);
+  } else if (kind === 'shield') {
+    P.shieldT = 5;
+    popup('PHASE SHIELD', PERKS.shield.css, false);
+    Audio2.beep(600, 1200, 0.35, 'triangle', 0.22);
+  } else if (kind === 'magnet') {
+    const t = nearestTargetAhead(60, 0.9);
+    if (!t) { popup('NO TARGET', '#888', false); consumed = false; }
+    else {
+      P.magT = 1.15; P.magTarget = t;
+      const stolen = t.steal(0.3);
+      B.speed += Math.min(18, stolen * 0.8 + 6);
+      popup('MAGNET YANK', PERKS.magnet.css, false);
+      Audio2.beep(900, 1800, 0.3, 'sine', 0.22);
+    }
+  } else if (kind === 'dash') {
+    if (!tryDash()) { popup('BLOCKED', '#888', false); consumed = false; }
+  }
+  if (consumed) { P.held = null; P.fireCd = 0.4; updatePerkHUD(); }
+}
+
+/* ---- per-frame perk update ---- */
+const slickDummy = new THREE.Object3D();
+function updatePerks(dt) {
+  P.fireCd = Math.max(0, P.fireCd - dt);
+  P.shieldT = Math.max(0, P.shieldT - dt);
+  P.dashI = Math.max(0, P.dashI - dt);
+  P.scrT = Math.max(0, P.scrT - dt);
+  P.odT = Math.max(0, P.odT - dt);
+  P.odK = lerp(P.odK, P.odT > 0 ? 1 : 0, 1 - Math.exp(-6 * dt));
+  fxFlash.a = Math.max(0, fxFlash.a - dt * 1.6);
+
+  if (pressed.f) firePerk();
+
+  // slick drops trail out behind
+  if (P.slickDrops > 0) {
+    P.slickTimer -= dt;
+    if (P.slickTimer <= 0) {
+      dropSlickAt(B.x - Math.sin(B.velAngle) * 2.5, B.z - Math.cos(B.velAngle) * 2.5, 'player');
+      P.slickDrops--; P.slickTimer = 0.28;
+    }
+  }
+
+  // orb pickups + animation
+  for (let i = 0; i < perkOrbs.length; i++) {
+    const o = perkOrbs[i];
+    if (!o.active) {
+      o.respawn -= dt;
+      if (o.respawn <= 0) {
+        relocatePerkOrb(o);
+        o.active = true;
+        const c = new THREE.Color(PERKS[o.kind].color);
+        perkOrbMesh.setColorAt(i, c);
+        if (perkOrbMesh.instanceColor) perkOrbMesh.instanceColor.needsUpdate = true;
+        const ca = perkOrbGlow.geometry.attributes.aColor;
+        ca.setXYZ(i, c.r, c.g, c.b); ca.needsUpdate = true;
+      }
+    } else {
+      const dx = o.x - B.x, dz = o.z - B.z;
+      if (dx * dx + dz * dz < 8.4 && Math.abs(o.y - B.y) < 3) {
+        P.held = o.kind;
+        o.active = false; o.respawn = 16;
+        updatePerkHUD();
+        popup(PERKS[o.kind].name, PERKS[o.kind].css, false);
+        Audio2.beep(700, 1500, 0.18, 'sine', 0.22);
+        for (let j = 0; j < 8; j++) {
+          const c = new THREE.Color(PERKS[o.kind].color);
+          PSYS.spawn(o.x, o.y, o.z, R(-5, 5), R(-1, 6), R(-5, 5),
+            R(0.25, 0.5), R(0.3, 0.55), 1.6, c.r, c.g, c.b, 0.9, 5);
+        }
+      } else if (window.Race) {
+        Race.tryCollectOrb(o, i);
+      }
+    }
+    // instanced transform
+    slickDummy.rotation.set(0, elapsed * 2.4 + o.phase, 0);
+    if (o.active) {
+      slickDummy.position.set(o.x, o.y + Math.sin(elapsed * 2 + o.phase) * 0.3, o.z);
+      slickDummy.scale.setScalar(1);
+    } else {
+      slickDummy.position.set(0, -60, 0);
+      slickDummy.scale.setScalar(0.001);
+    }
+    slickDummy.updateMatrix();
+    perkOrbMesh.setMatrixAt(i, slickDummy.matrix);
+    const pa = perkOrbGlow.geometry.attributes.position;
+    pa.setXYZ(i, o.x, o.active ? o.y : -60, o.z);
+  }
+  perkOrbMesh.instanceMatrix.needsUpdate = true;
+  perkOrbGlow.geometry.attributes.position.needsUpdate = true;
+
+  // slicks: age, render, victims
+  for (let i = slicks.length - 1; i >= 0; i--) {
+    const s = slicks[i];
+    s.life -= dt; s.age += dt;
+    if (s.life <= 0) { slicks.splice(i, 1); continue; }
+    // player crossing (own slicks safe for 1.4s)
+    if (!(s.owner === 'player' && s.age < 1.4) && B.grounded && B.y < 1.5) {
+      const dx = B.x - s.x, dz = B.z - s.z;
+      if (dx * dx + dz * dz < 5.3) playerOiled();
+    }
+    // traffic crossing
+    for (const c of cars) {
+      if ((c.spin || 0) > 0) continue;
+      const dx = (c.x || 0) - s.x, dz = (c.z || 0) - s.z;
+      if (dx * dx + dz * dz < 6.5) c.spin = 1.5;
+    }
+  }
+  for (let i = 0; i < SLICK_MAX; i++) {
+    const s = slicks[i];
+    if (s) {
+      slickDummy.position.set(s.x, 0.16, s.z);
+      slickDummy.rotation.set(0, 0, 0);
+      slickDummy.scale.setScalar(Math.min(1, s.age * 4) * (s.life < 3 ? s.life / 3 : 1));
+    } else {
+      slickDummy.position.set(0, -60, 0); slickDummy.scale.setScalar(0.001);
+      slickDummy.rotation.set(0, 0, 0);
+    }
+    slickDummy.updateMatrix();
+    slickMesh.setMatrixAt(i, slickDummy.matrix);
+  }
+  slickMesh.instanceMatrix.needsUpdate = true;
+
+  // flares
+  for (let i = flares.length - 1; i >= 0; i--) {
+    const f = flares[i];
+    f.life -= dt;
+    if (f.target) {
+      const want = Math.atan2(f.target.x - f.x, f.target.z - f.z);
+      f.ang += clamp(angleDiff(want, f.ang), -3.5 * dt, 3.5 * dt);
+    }
+    f.x += Math.sin(f.ang) * 58 * dt;
+    f.z += Math.cos(f.ang) * 58 * dt;
+    PSYS.spawn(f.x, f.y, f.z, R(-1, 1), R(-0.5, 1), R(-1, 1),
+      R(0.2, 0.4), R(0.35, 0.6), 1.2, 1.0, 0.6, 0.2, 0.9, 0);
+    let hit = f.life <= 0;
+    const victims = f.target ? [f.target] : getPerkTargets().concat([playerTarget]);
+    for (const t of victims) {
+      if (t === f.owner) continue;
+      const dx = t.x - f.x, dz = t.z - f.z;
+      if (dx * dx + dz * dz < 7) {
+        if (!(t.shielded && t.shielded())) t.stun(1.2);
+        hit = true;
+        break;
+      }
+    }
+    if (hit) {
+      for (let j = 0; j < 14; j++) {
+        PSYS.spawn(f.x, f.y, f.z, R(-8, 8), R(-2, 8), R(-8, 8),
+          R(0.3, 0.6), R(0.4, 0.7), 2, 1.0, 0.55, 0.15, 0.9, 8);
+      }
+      Audio2.noise(0.25, 800, 0.25);
+      flares.splice(i, 1);
+    }
+  }
+
+  // EMP ring anim
+  if (empFx.t < 0.55) {
+    empFx.t += dt;
+    const k = empFx.t / 0.55;
+    empFx.mesh.scale.setScalar(1 + k * 34);
+    empFx.mesh.material.opacity = 0.9 * (1 - k);
+    if (empFx.t >= 0.55) empFx.mesh.visible = false;
+  }
+
+  // shield visuals
+  shieldMesh.visible = P.shieldT > 0;
+  if (shieldMesh.visible) {
+    const flick = P.shieldT < 1.5 ? (Math.sin(elapsed * 30) > 0 ? 1 : 0.3) : 1;
+    shieldMesh.material.opacity = (0.16 + Math.sin(elapsed * 8) * 0.05) * flick;
+    shieldMesh.scale.setScalar(1 + Math.sin(elapsed * 6) * 0.04);
+  }
+
+  // magnet pull
+  if (P.magT > 0 && P.magTarget) {
+    P.magT -= dt;
+    const t = P.magTarget;
+    const want = Math.atan2(t.x - B.x, t.z - B.z);
+    B.velAngle += clamp(angleDiff(want, B.velAngle), -2.6 * dt, 2.6 * dt);
+    B.bikeYaw += clamp(angleDiff(want, B.bikeYaw), -2.6 * dt, 2.6 * dt);
+    tether.visible = true;
+    const tp = tether.geometry.attributes.position;
+    tp.setXYZ(0, B.x, B.y + 0.8, B.z);
+    tp.setXYZ(1, t.x, B.y + 0.8, t.z);
+    tp.needsUpdate = true;
+    if (P.magT <= 0 || Math.hypot(t.x - B.x, t.z - B.z) < 4) { P.magT = 0; tether.visible = false; }
+  } else {
+    tether.visible = false;
+  }
+}
+
+/* ---- perk HUD ---- */
+function updatePerkHUD() {
+  const slot = $('perkslot'), glyph = $('perkglyph'), name = $('perkname');
+  if (!slot) return;
+  if (P.held) {
+    const d = PERKS[P.held];
+    glyph.textContent = d.glyph;
+    name.textContent = d.name;
+    slot.style.borderColor = d.css;
+    slot.style.color = d.css;
+    slot.classList.add('held');
+  } else {
+    glyph.textContent = '—';
+    name.textContent = 'NO PERK';
+    slot.style.borderColor = 'rgba(255,255,255,.22)';
+    slot.style.color = '#777';
+    slot.classList.remove('held');
+  }
 }
 
 /* ================= INPUT ================= */
@@ -445,6 +954,9 @@ const B = {
   wobble: 0, wheelRot: 0,
   boost: 60, boosting: false, boostK: 0,
   lean: 0, pitch: 0, accelSmooth: 0,
+  leanV: 0, susp: 0, suspV: 0,
+  wheelie: 0, wheelieT: 0,
+  lowGrip: 0, crashT: 0, safeT: 0, crashDir: 1,
 };
 let score = 0, chain = 0, comboTimer = 0;
 let best = 0;
@@ -495,11 +1007,19 @@ const fxCanvas = $('fx');
 const fxCtx = fxCanvas.getContext('2d');
 function sizeFx() { fxCanvas.width = window.innerWidth; fxCanvas.height = window.innerHeight; }
 sizeFx();
-window.onGameResize = () => { sizeFx(); updatePxScale(); };
+window.onGameResize = () => {
+  sizeFx();
+  updatePxScale();
+  if (typeof POST !== 'undefined') POST.resize(window.innerWidth, window.innerHeight);
+};
 
 function drawFx(speedK, boostK) {
   const w = fxCanvas.width, h = fxCanvas.height;
   fxCtx.clearRect(0, 0, w, h);
+  if (fxFlash.a > 0.01) {
+    fxCtx.fillStyle = 'rgba(' + fxFlash.r + ',' + fxFlash.g + ',' + fxFlash.b + ',' + (fxFlash.a * 0.5).toFixed(3) + ')';
+    fxCtx.fillRect(0, 0, w, h);
+  }
   const f = Math.max(0, speedK - 0.45) * 1.8 + boostK * 0.7;
   if (f < 0.05 || gameState !== 'play') return;
   const cx = w / 2, cy = h / 2;
@@ -523,45 +1043,153 @@ function drawFx(speedK, boostK) {
 /* ================= MINIMAP ================= */
 const mapCanvas = $('map');
 const mapCtx = mapCanvas.getContext('2d');
-const mapBase = document.createElement('canvas');
-mapBase.width = mapBase.height = 170;
-(() => {
-  const g = mapBase.getContext('2d');
-  const sc = 170 / WORLD;
-  g.fillStyle = '#120a20'; g.fillRect(0, 0, 170, 170);
-  g.strokeStyle = '#332450'; g.lineWidth = Math.max(1.4, ROADW * sc);
-  for (let k = 0; k <= GRID; k++) {
-    const p = (k * CELL) * sc;
-    g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 170); g.stroke();
-    g.beginPath(); g.moveTo(0, p); g.lineTo(170, p); g.stroke();
-  }
-  g.strokeStyle = '#ff2d95'; g.lineWidth = 2;
-  g.strokeRect(1, 1, 168, 168);
-  // ramps
-  g.fillStyle = '#00e5ff';
-  for (const r of ramps) {
-    g.fillRect((r.x + HALF) * sc - 1.5, (r.z + HALF) * sc - 1.5, 3, 3);
-  }
-})();
-const w2m = (v) => (v + HALF) * (170 / WORLD);
-function drawMinimap() {
-  mapCtx.clearRect(0, 0, 170, 170);
-  mapCtx.drawImage(mapBase, 0, 0);
-  mapCtx.fillStyle = '#49f8ff';
-  for (const o of orbs) if (o.active) mapCtx.fillRect(w2m(o.x) - 1, w2m(o.z) - 1, 2, 2);
-  mapCtx.fillStyle = '#ffaa44';
-  for (const c of cars) mapCtx.fillRect(w2m(c.x || 0) - 1, w2m(c.z || 0) - 1, 2, 2);
-  // player arrow
-  const px = w2m(B.x), pz = w2m(B.z);
+var MAP = { headingUp: true };
+let mapRot = 0, mapK = 1, mapView = 320;
+
+function mapPt(x, z, out) {
+  const dx = x - B.x, dz = z - B.z;
+  const cr = Math.cos(mapRot), sr = Math.sin(mapRot);
+  out.x = 85 + (dx * cr - dz * sr) * mapK;
+  out.y = 85 + (dx * sr + dz * cr) * mapK;
+  return out;
+}
+const mp = { x: 0, y: 0 };
+function mapArrow(x, z, yaw, size, color) {
+  mapPt(x, z, mp);
+  if (mp.x < -6 || mp.x > 176 || mp.y < -6 || mp.y > 176) return;
   mapCtx.save();
-  mapCtx.translate(px, pz);
-  mapCtx.rotate(-B.velAngle);
-  mapCtx.fillStyle = '#ffffff';
-  mapCtx.shadowColor = '#ff2d95'; mapCtx.shadowBlur = 6;
+  mapCtx.translate(mp.x, mp.y);
+  mapCtx.rotate(mapRot - yaw);
+  mapCtx.fillStyle = color;
   mapCtx.beginPath();
-  mapCtx.moveTo(0, 5); mapCtx.lineTo(-3.4, -4); mapCtx.lineTo(3.4, -4);
+  mapCtx.moveTo(0, size); mapCtx.lineTo(-size * 0.68, -size * 0.8); mapCtx.lineTo(size * 0.68, -size * 0.8);
   mapCtx.closePath(); mapCtx.fill();
   mapCtx.restore();
+}
+function drawMinimap(dt) {
+  const spdK = clamp(Math.abs(B.speed) / 105, 0, 1);
+  mapView = lerp(mapView, 300 + spdK * 220, 1 - Math.exp(-3 * (dt || 0.016)));   // zoom out with speed
+  mapK = 170 / mapView;
+  mapRot = MAP.headingUp ? B.velAngle - Math.PI : 0;
+
+  mapCtx.clearRect(0, 0, 170, 170);
+  mapCtx.save();
+  mapCtx.beginPath();
+  mapCtx.arc(85, 85, 84, 0, TAU);
+  mapCtx.clip();
+  mapCtx.fillStyle = '#0d0718';
+  mapCtx.fillRect(0, 0, 170, 170);
+
+  // base city (rotated + zoomed around the player)
+  mapCtx.save();
+  mapCtx.translate(85, 85);
+  mapCtx.rotate(mapRot);
+  const bs = mapK / worldMapScale;
+  mapCtx.scale(bs, bs);
+  mapCtx.translate(-(B.x + HALF) * worldMapScale, -(B.z + HALF) * worldMapScale);
+  mapCtx.drawImage(worldMapCanvas, 0, 0);
+  mapCtx.restore();
+
+  const viewR = mapView * 0.62;
+  // race route + checkpoints
+  const route = window.Race && Race.activeRoute;
+  if (route) {
+    mapCtx.strokeStyle = route.def.css;
+    mapCtx.lineWidth = 2.4;
+    mapCtx.globalAlpha = 0.85;
+    mapCtx.beginPath();
+    let started = false;
+    for (let i = 0; i <= route.pts.length; i += 3) {
+      const p = route.pts[i % route.pts.length];
+      mapPt(p.x, p.z, mp);
+      if (!started) { mapCtx.moveTo(mp.x, mp.y); started = true; }
+      else mapCtx.lineTo(mp.x, mp.y);
+    }
+    mapCtx.stroke();
+    mapCtx.globalAlpha = 1;
+    const nextI = Race.cpNext % route.cps.length;
+    route.cps.forEach((cp, ci) => {
+      mapPt(cp.x, cp.z, mp);
+      if (ci === nextI) {
+        const pulse = 4.5 + Math.sin(elapsed * 6) * 1.5;
+        mapCtx.strokeStyle = '#fff';
+        mapCtx.lineWidth = 2;
+        mapCtx.beginPath(); mapCtx.arc(mp.x, mp.y, pulse, 0, TAU); mapCtx.stroke();
+      } else {
+        mapCtx.fillStyle = route.def.css;
+        mapCtx.beginPath(); mapCtx.arc(mp.x, mp.y, 2.4, 0, TAU); mapCtx.fill();
+      }
+    });
+  } else if (window.Race) {
+    // gates as flags when free-roaming
+    for (const rt of Race.routes) {
+      const g = rt.cps[0];
+      if (Math.hypot(g.x - B.x, g.z - B.z) > viewR * 1.4) continue;
+      mapPt(g.x, g.z, mp);
+      mapCtx.fillStyle = rt.def.css;
+      mapCtx.fillRect(mp.x - 1, mp.y - 7, 2, 7);
+      mapCtx.beginPath();
+      mapCtx.moveTo(mp.x + 1, mp.y - 7); mapCtx.lineTo(mp.x + 7, mp.y - 4.8); mapCtx.lineTo(mp.x + 1, mp.y - 2.6);
+      mapCtx.closePath(); mapCtx.fill();
+    }
+  }
+
+  // score orbs
+  mapCtx.fillStyle = '#49f8ff';
+  for (const o of orbs) {
+    if (!o.active || Math.abs(o.x - B.x) > viewR || Math.abs(o.z - B.z) > viewR) continue;
+    mapPt(o.x, o.z, mp);
+    mapCtx.fillRect(mp.x - 1, mp.y - 1, 2, 2);
+  }
+  // perk orbs as diamonds
+  for (const o of perkOrbs) {
+    if (!o.active || Math.abs(o.x - B.x) > viewR || Math.abs(o.z - B.z) > viewR) continue;
+    mapPt(o.x, o.z, mp);
+    mapCtx.fillStyle = PERKS[o.kind].css;
+    mapCtx.save();
+    mapCtx.translate(mp.x, mp.y);
+    mapCtx.rotate(Math.PI / 4);
+    mapCtx.fillRect(-2.4, -2.4, 4.8, 4.8);
+    mapCtx.restore();
+  }
+  // oil slicks
+  mapCtx.fillStyle = '#6a3caa';
+  for (const s of slicks) {
+    if (Math.abs(s.x - B.x) > viewR || Math.abs(s.z - B.z) > viewR) continue;
+    mapPt(s.x, s.z, mp);
+    mapCtx.beginPath(); mapCtx.arc(mp.x, mp.y, 2.2, 0, TAU); mapCtx.fill();
+  }
+  // traffic
+  mapCtx.fillStyle = '#ffaa44';
+  for (const c of cars) {
+    if (Math.abs((c.x || 0) - B.x) > viewR || Math.abs((c.z || 0) - B.z) > viewR) continue;
+    mapPt(c.x || 0, c.z || 0, mp);
+    mapCtx.fillRect(mp.x - 1, mp.y - 1, 2, 2);
+  }
+  // rivals as colored arrows
+  if (window.Race) {
+    for (const r of Race.getRivalStates()) {
+      if (Math.abs(r.x - B.x) > viewR * 1.6 || Math.abs(r.z - B.z) > viewR * 1.6) continue;
+      mapArrow(r.x, r.z, r.yaw, 4.4, r.def.css);
+    }
+  }
+
+  // player arrow (center)
+  mapCtx.shadowColor = '#ff2d95'; mapCtx.shadowBlur = 6;
+  mapArrow(B.x, B.z, B.velAngle, 5, '#ffffff');
+  mapCtx.shadowBlur = 0;
+
+  // north indicator
+  mapCtx.fillStyle = 'rgba(255,255,255,.7)';
+  mapCtx.font = '700 10px sans-serif';
+  mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'middle';
+  mapCtx.fillText('N', 85 + Math.sin(mapRot) * 74, 85 - Math.cos(mapRot) * 74);
+
+  mapCtx.restore();
+  // rim
+  mapCtx.strokeStyle = 'rgba(255,45,149,.55)';
+  mapCtx.lineWidth = 2;
+  mapCtx.beginPath(); mapCtx.arc(85, 85, 83.5, 0, TAU); mapCtx.stroke();
 }
 
 /* ================= PHYSICS HELPERS ================= */
@@ -576,7 +1204,40 @@ function roofHeightAt(x, z, y) {
   return h;
 }
 function groundAt(x, z, y) {
-  return Math.max(groundHeightAt(x, z), roofHeightAt(x, z, y));
+  return Math.max(groundHeightAt(x, z, y), roofHeightAt(x, z, y));
+}
+
+/* ---- traction / surfaces ----
+   chase:    how fast the velocity direction follows the heading (rad/s per rad of slip)
+   maxTurn:  grip limit — max rate the velocity direction can turn (rad/s); steer
+             faster than this and the tires let go (slip grows instead)
+   drift*:   same pair while Q/E drift is held
+   scrub:    speed bled per second at full slip angle
+   drag:     extra rolling drag on this surface */
+const TRACTION = {
+  road:    { chase: 11,  maxTurn: 2.6,  driftChase: 3.6, driftMaxTurn: 1.38, scrub: 0.3,  drag: 0    },
+  offroad: { chase: 4.5, maxTurn: 1.15, driftChase: 2.6, driftMaxTurn: 0.95, scrub: 0.95, drag: 0.25 },
+};
+function surfaceAt(x, z) {
+  if (typeof onRoadStrip === 'function' && onRoadStrip(x, z)) return 'road';   // alleys
+  if (groundHeightAt(x, z, B.y) > 1.5) return 'road';   // ramps, overpasses, decks
+  if (B.grounded && B.y > 1.5) return 'road';           // rooftops: concrete
+  const ux = (x + HALF) % CELL, uz = (z + HALF) % CELL;
+  const dx = Math.min(Math.abs(ux), CELL - Math.abs(ux));
+  const dz = Math.min(Math.abs(uz), CELL - Math.abs(uz));
+  return Math.min(dx, dz) <= ROADW / 2 + 1 ? 'road' : 'offroad';
+}
+
+function startCrash(sev) {
+  if (B.crashT > 0 || B.safeT > 0) return false;
+  B.crashT = 0.85 + sev * 0.6;
+  B.crashDir = Math.random() < 0.5 ? 1 : -1;
+  if (B.drift) { B.drift = 0; B.driftTime = 0; }
+  B.wheelie = 0; B.wheelieT = 0; B.wobble = 1;
+  B.lowGrip = Math.max(B.lowGrip, B.crashT + 0.4);
+  breakCombo();
+  shakeT = Math.min(1, 0.4 + sev * 0.4);
+  return true;
 }
 
 function collideWorld(dt) {
@@ -602,16 +1263,31 @@ function collideWorld(dt) {
     }
     hitResponse(nx, nz);
   }
-  // cars
-  for (const c of cars) {
-    const ex = c.hx + r, ez = c.hz + r;
-    if (Math.abs(B.x - c.x) < ex && Math.abs(B.z - c.z) < ez && B.y < 1.6) {
-      const pX = ex - Math.abs(B.x - c.x), pZ = ez - Math.abs(B.z - c.z);
-      let nx = 0, nz = 0;
-      if (pX < pZ) { nx = Math.sign(B.x - c.x) || 1; B.x += nx * pX; }
-      else { nz = Math.sign(B.z - c.z) || 1; B.z += nz * pZ; }
-      hitResponse(nx, nz);
-      c.nm = 6;
+  // cars + rival racers (phase shield / ghost dash pass through)
+  if (!(P.shieldT > 0 || P.dashI > 0)) {
+    for (const c of cars) {
+      const ex = c.hx + r, ez = c.hz + r;
+      if (Math.abs(B.x - c.x) < ex && Math.abs(B.z - c.z) < ez && B.y < 1.6) {
+        const pX = ex - Math.abs(B.x - c.x), pZ = ez - Math.abs(B.z - c.z);
+        let nx = 0, nz = 0;
+        if (pX < pZ) { nx = Math.sign(B.x - c.x) || 1; B.x += nx * pX; }
+        else { nz = Math.sign(B.z - c.z) || 1; B.z += nz * pZ; }
+        hitResponse(nx, nz);
+        c.nm = 6;
+      }
+    }
+    if (window.Race) {
+      for (const rb of Race.getColliders()) {
+        const ex = 1.0 + r, ez = 1.4 + r;
+        if (Math.abs(B.x - rb.x) < ex && Math.abs(B.z - rb.z) < ez && Math.abs(B.y - rb.y) < 1.8) {
+          const pX = ex - Math.abs(B.x - rb.x), pZ = ez - Math.abs(B.z - rb.z);
+          let nx = 0, nz = 0;
+          if (pX < pZ) { nx = Math.sign(B.x - rb.x) || 1; B.x += nx * pX; }
+          else { nz = Math.sign(B.z - rb.z) || 1; B.z += nz * pZ; }
+          hitResponse(nx, nz);
+          if (rb.onBump) rb.onBump(nx, nz);
+        }
+      }
     }
   }
   // boundary walls
@@ -640,13 +1316,16 @@ function hitResponse(nx, nz) {
     breakCombo();
     if (B.drift) { B.drift = 0; B.driftTime = 0; }
     B.wobble = Math.min(1, impact * 0.03);
+    // kick the heading toward the deflected velocity so grip doesn't steer us back into the wall
+    B.bikeYaw += clamp(angleDiff(B.velAngle, B.bikeYaw), -0.6, 0.6) * 0.5;
+    B.suspV += Math.min(2.5, impact * 0.06);
     // sparks
     for (let i = 0; i < 14; i++) {
       PSYS.spawn(B.x - nx * 0.5, B.y + 0.5 + Math.random() * 0.5, B.z - nz * 0.5,
         nx * R(2, 9) + R(-4, 4), R(1, 7), nz * R(2, 9) + R(-4, 4),
         R(0.25, 0.6), R(0.18, 0.4), 1.5, 1.0, 0.7, 0.25, 0.9, 22);
     }
-    if (impact > 25) popup('CRASH', '#ff5566', false);
+    if (impact > 25 && startCrash(Math.min(1, impact / 45))) popup('CRASH', '#ff5566', false);
   }
 }
 
@@ -668,7 +1347,7 @@ function endDrift(cancel) {
   B.drift = 0; B.driftTime = 0;
 }
 
-function onLand() {
+function onLand(impactV) {
   const wasAir = B.airTime;
   const diff = angleDiff(B.bikeYaw, B.velAngle);
   const off = Math.abs(diff);
@@ -685,11 +1364,22 @@ function onLand() {
     B.boost = Math.min(100, B.boost + 10);
     Audio2.trickLand();
   }
+  // suspension thump + body roll; hard hits also cost traction for a beat
+  B.suspV += Math.min(4, impactV * 0.18);
+  B.leanV += (Math.random() < 0.5 ? -1 : 1) * Math.min(1.6, impactV * 0.09);
+  if (impactV > 12) {
+    B.lowGrip = Math.max(B.lowGrip, 0.35);
+    shakeT = Math.max(shakeT, Math.min(0.3, impactV * 0.012));
+  }
   if (backwards) {
-    B.speed *= 0.25; B.wobble = 1; shakeT = Math.max(shakeT, 0.5);
-    Audio2.crash(0.4); popup('WIPEOUT', '#ff5566', true); breakCombo();
+    B.speed *= 0.3;
+    Audio2.crash(0.45);
+    if (startCrash(0.65)) popup('WIPEOUT', '#ff5566', true);
+    else { B.wobble = 1; shakeT = Math.max(shakeT, 0.5); breakCombo(); }
   } else if (!clean) {
-    B.speed *= 0.62; B.wobble = 0.7; shakeT = Math.max(shakeT, 0.25);
+    // sideways landing: keep the momentum, slide it out on reduced grip
+    B.speed *= 0.75; B.wobble = 0.7; shakeT = Math.max(shakeT, 0.25);
+    B.lowGrip = Math.max(B.lowGrip, 0.55);
     Audio2.land();
   } else if (wasAir > 0.35) {
     Audio2.land();
@@ -700,10 +1390,9 @@ function onLand() {
         0.65, 0.45, 0.75, 0.35, 4);
     }
   }
-  B.velAngle = B.bikeYaw = B.velAngle + (clean ? clamp(diff, -0.35, 0.35) : 0);
   B.trickAccum = 0; B.spinVel = 0; B.airTime = 0;
   B.grounded = true; B.vy = 0;
-  if ((keys.q || keys.e) && B.speed > 15 && !backwards) startDrift(keys.q ? 1 : -1);
+  if ((keys.q || keys.e) && B.speed > 15 && !backwards && !B.crashT) startDrift(keys.q ? 1 : -1);
 }
 
 /* ================= MAIN UPDATE ================= */
@@ -711,38 +1400,80 @@ const tmpWorld = new THREE.Vector3();
 let prevW = false, backfireT = 0;
 function updateBike(dt) {
   const steer = (keys.a ? 1 : 0) - (keys.d ? 1 : 0);
-  const throttle = keys.w ? 1 : (keys.s ? -1 : 0);
+  let throttle = keys.w ? 1 : (keys.s ? -1 : 0);
   const demoSteer = DEMO ? Math.sin(elapsed * 0.5) * 0.1 : 0;
-  const st = DEMO ? demoSteer : steer;
+  let st = DEMO ? demoSteer : steer;
 
-  // --- boost
-  B.boosting = keys.shift && B.boost > 0.5 && B.speed > 1 && throttle >= 0;
-  if (B.boosting) B.boost = Math.max(0, B.boost - 25 * dt);
+  // --- traction-loss timers
+  B.lowGrip = Math.max(0, B.lowGrip - dt);
+  B.safeT = Math.max(0, B.safeT - dt);
+
+  // --- crash state: controls locked, bike slides out, then recovers
+  const crashing = B.crashT > 0;
+  if (crashing) {
+    B.crashT -= dt;
+    st = 0; throttle = 0;
+    B.speed -= B.speed * 2.0 * dt;
+    if (B.grounded) {
+      B.bikeYaw += B.crashDir * 3.0 * clamp(B.crashT, 0, 1) * dt;
+      if (Math.abs(B.speed) > 4 && Math.random() < dt * 40) {
+        PSYS.spawn(B.x + R(-0.6, 0.6), B.y + 0.2, B.z + R(-0.6, 0.6),
+          R(-2, 2), R(0.5, 3), R(-2, 2), R(0.3, 0.7), R(0.4, 0.8), 3,
+          0.7, 0.55, 0.4, 0.5, 3);
+      }
+    }
+    if (B.crashT <= 0) { B.safeT = 0.9; B.wobble = 0.8; }
+  }
+
+  const surf = surfaceAt(B.x, B.z);
+  const T = TRACTION[surf];
+
+  // --- EMP scramble: steering input goes haywire
+  if (P.scrT > 0 && !crashing) {
+    st = st * -0.5 + Math.sin(elapsed * 12.7) * 0.85;
+  }
+
+  // --- boost (overdrive perk forces a bigger, free boost)
+  const od = P.odT > 0;
+  B.boosting = !crashing && (od || (keys.shift && B.boost > 0.5 && B.speed > 1 && throttle >= 0));
+  if (B.boosting && !od) B.boost = Math.max(0, B.boost - 25 * dt);
   B.boostK = lerp(B.boostK, B.boosting ? 1 : 0, 1 - Math.exp(-7 * dt));
 
   // --- longitudinal
-  const top = B.boosting ? 105 : 74;
+  const top = od ? 130 : (B.boosting ? 105 : 74);
   if (throttle > 0 || B.boosting) {
-    const a = (B.boosting ? 56 : 34) * clamp(1 - B.speed / top, -0.35, 1);
+    const a = (od ? 72 : (B.boosting ? 56 : 34)) * clamp(1 - B.speed / top, -0.35, 1);
     B.speed += a * dt;
     B.accelSmooth = lerp(B.accelSmooth, a, 1 - Math.exp(-5 * dt));
   } else {
     B.accelSmooth = lerp(B.accelSmooth, 0, 1 - Math.exp(-5 * dt));
   }
   if (throttle < 0) B.speed = Math.max(B.speed - 62 * dt, -13);
-  B.speed -= B.speed * 0.13 * dt;
+  B.speed -= B.speed * (0.13 + (B.grounded ? T.drag : 0)) * dt;
   if (Math.abs(B.speed) < 0.15 && throttle === 0) B.speed = 0;
 
-  // --- steering / drift
+  // --- wheelie: hard throttle at low speed lifts the front
+  const wantWheelie = B.grounded && !crashing && !B.drift && throttle > 0 &&
+    B.accelSmooth > 16 && B.speed > 1.5 && B.speed < 15;
+  B.wheelie = lerp(B.wheelie, wantWheelie ? 1 : 0, 1 - Math.exp(-(wantWheelie ? 3.5 : 8) * dt));
+  if (B.wheelie > 0.45) {
+    B.wheelieT += dt;
+    B.boost = Math.min(100, B.boost + 4 * dt);
+    if (B.wheelieT > 1.1) { addScore(40, 'WHEELIE', '#7cff4d', false); B.wheelieT = 0; }
+  } else if (!wantWheelie) {
+    B.wheelieT = 0;
+  }
+
+  // --- steering / drift (steering turns the heading; grip turns the velocity)
   if (B.grounded) {
-    if (pressed.space) {
+    if (pressed.space && !crashing) {
       B.vy = 8.8 + Math.abs(B.speed) * 0.02;
       B.grounded = false; B.airTime = 0;
       Audio2.hop();
       if (B.drift) endDrift(true);
     } else {
       // drift start
-      if (!B.drift && B.speed > 15) {
+      if (!B.drift && !crashing && B.speed > 15) {
         if (pressed.q) startDrift(1);
         else if (pressed.e) startDrift(-1);
       }
@@ -753,36 +1484,66 @@ function updateBike(dt) {
         else {
           B.driftTime += dt;
           const scale = clamp(B.speed / 30, 0.55, 1.15);
-          B.velAngle += (B.drift * 1.55 + st * 0.9) * scale * dt;
+          B.bikeYaw += (B.drift * 1.55 + st * 0.9) * scale * dt;
           B.boost = Math.min(100, B.boost + 13 * dt);
-          // tire smoke
+          // tire smoke — color reads the drift stage: white → pink → flame
           if (Math.random() < dt * 95) {
             leanGroup.updateMatrixWorld();
             tmpWorld.set(R(-0.4, 0.4), 0.2, -0.8).applyMatrix4(leanGroup.matrixWorld);
-            const hot = B.driftTime > 1.7;
+            const stage = B.driftTime > 2.8 ? 2 : B.driftTime > 1.7 ? 1 : 0;
+            const sc = stage === 2 ? [1.0, 0.82, 0.45, 0.75] : stage === 1 ? [1.0, 0.45, 0.75, 0.6] : [0.85, 0.5, 0.95, 0.35];
             PSYS.spawn(tmpWorld.x, tmpWorld.y, tmpWorld.z,
               R(-2, 2) - Math.sin(B.velAngle) * 2, R(0.5, 2.5), R(-2, 2) - Math.cos(B.velAngle) * 2,
               R(0.4, 0.8), R(0.5, 0.85), 3.2,
-              hot ? 1.0 : 0.85, hot ? 0.45 : 0.5, hot ? 0.75 : 0.95, hot ? 0.6 : 0.35, 0);
+              sc[0], sc[1], sc[2], sc[3], 0);
+            if (stage === 2 && Math.random() < 0.4) {   // embers at full charge
+              PSYS.spawn(tmpWorld.x, tmpWorld.y, tmpWorld.z,
+                R(-3, 3), R(2, 5), R(-3, 3), R(0.3, 0.5), R(0.15, 0.3), 1, 1.0, 0.7, 0.2, 0.9, 14);
+            }
           }
         }
       } else {
-        const steerRate = lerp(2.25, 0.78, clamp((B.speed - 4) / 72, 0, 1));
-        B.velAngle += st * steerRate * dt * (B.speed > 0.5 ? 1 : (B.speed < -0.5 ? -1 : 0));
+        const steerRate = lerp(2.25, 0.78, clamp((B.speed - 4) / 72, 0, 1)) * (1 - B.wheelie * 0.55);
+        B.bikeYaw += st * steerRate * dt * (B.speed > 0.5 ? 1 : (B.speed < -0.5 ? -1 : 0));
       }
     }
-    const targetOff = B.drift ? B.drift * (0.52 + (st * B.drift > 0 ? 0.2 : 0)) : 0;
-    B.driftOffset = lerp(B.driftOffset, targetOff, 1 - Math.exp(-7 * dt));
-    B.bikeYaw = B.velAngle + B.driftOffset;
+    // traction curve: velocity direction chases the heading; the chase rate
+    // saturates at the grip limit, past which the bike slides (drift/offroad/lowGrip)
+    if (B.speed > 0.5) {
+      let chase = (B.drift ? T.driftChase : T.chase) + 40 / Math.max(B.speed, 2);
+      let maxTurn = (B.drift ? T.driftMaxTurn : T.maxTurn) * clamp(B.speed / 12, 0.75, 1.15);
+      if (B.lowGrip > 0) { chase *= 0.3; maxTurn *= 0.55; }
+      if (crashing) chase *= 0.5;
+      const slip0 = angleDiff(B.bikeYaw, B.velAngle);
+      B.velAngle += clamp(slip0 * chase, -maxTurn, maxTurn) * dt;
+      B.speed -= B.speed * T.scrub * Math.abs(Math.sin(slip0)) * dt;
+      if (!crashing) {
+        // slip-angle cap: past this the front washes out and the heading stops leading
+        const slip1 = angleDiff(B.bikeYaw, B.velAngle);
+        const cap = B.drift ? 0.75 : 0.85;
+        if (Math.abs(slip1) > cap) B.bikeYaw = B.velAngle + Math.sign(slip1) * cap;
+      }
+    } else {
+      B.velAngle = B.bikeYaw;
+    }
+    // offroad dust kick
+    if (surf === 'offroad' && Math.abs(B.speed) > 9 && Math.random() < dt * 30) {
+      PSYS.spawn(B.x + R(-0.5, 0.5), B.y + 0.12, B.z + R(-0.5, 0.5),
+        R(-2, 2), R(1, 3), R(-2, 2), R(0.4, 0.8), R(0.5, 0.9), 2.8,
+        0.5, 0.42, 0.32, 0.4, 3);
+    }
   } else {
-    // airborne — short grace window so drift-hops don't trigger spins
+    // airborne — attitude control only, trajectory stays ballistic
+    // (short grace window so drift-hops don't trigger spins)
     B.airTime += dt;
-    B.velAngle += st * 0.5 * dt;
-    if ((keys.q || keys.e) && B.airTime > 0.22) B.spinVel = (keys.q ? 1 : -1) * 7.2;
+    B.bikeYaw += st * 0.6 * dt;
+    if ((keys.q || keys.e) && B.airTime > 0.22 && !crashing) B.spinVel = (keys.q ? 1 : -1) * 7.2;
     else B.spinVel *= Math.pow(0.0005, dt);
     B.bikeYaw += B.spinVel * dt;
     B.trickAccum += Math.abs(B.spinVel) * dt;
   }
+  // smoothed slip angle — feeds the camera and lean
+  B.driftOffset = lerp(B.driftOffset, angleDiff(B.bikeYaw, B.velAngle), 1 - Math.exp(-12 * dt));
 
   // --- vertical
   const ghNow = groundAt(B.x, B.z, B.y);
@@ -793,13 +1554,14 @@ function updateBike(dt) {
       B.airTime = 0;
     } else {
       B.rampRise = clamp((ghNow - B.y) / Math.max(dt, 0.001), 0, 42);
+      if (B.rampRise > 14) B.suspV += 0.3;   // curb / ramp-lip thump
       B.y = ghNow;
       B.vy = 0;
     }
   } else {
     B.vy -= 30 * dt;
     B.y += B.vy * dt;
-    if (B.y <= ghNow + 0.02 && B.vy <= 0) { B.y = ghNow; onLand(); }
+    if (B.y <= ghNow + 0.02 && B.vy <= 0) { const iv = -B.vy; B.y = ghNow; onLand(iv); }
   }
 
   // --- move + collide (substepped)
@@ -873,29 +1635,47 @@ function updateBike(dt) {
     if (comboTimer <= 0) breakCombo();
   }
 
+  // --- suspension: spring-damper compressed by landings, squat under acceleration
+  B.suspV += (-90 * B.susp - 11 * B.suspV) * dt;
+  B.susp += B.suspV * dt;
+  const squat = clamp(B.accelSmooth * 0.002, 0, 0.1);
+
   // --- visuals
   bikeGroup.position.set(B.x, B.y + 0.07, B.z);
   bikeGroup.rotation.y = B.bikeYaw;
   const spdK = clamp(B.speed / 40, 0, 1);
   const wob = Math.sin(elapsed * 26) * B.wobble * 0.22;
-  const leanTarget = B.grounded ? -(st * spdK * 0.42 + B.driftOffset * 0.62) + wob : wob * 0.5;
-  B.lean = lerp(B.lean, leanTarget, 1 - Math.exp(-8 * dt));
+  const leanTarget = B.grounded
+    ? clamp(-(st * spdK * 0.42 + B.driftOffset * 0.62), -0.85, 0.85) + wob
+    : wob * 0.5;
+  // slightly underdamped spring so landings and quick flicks overshoot into body roll
+  B.leanV += ((leanTarget - B.lean) * 70 - 10 * B.leanV) * dt;
+  B.lean = clamp(B.lean + B.leanV * dt, -1.1, 1.1);
   const pitchTarget = B.grounded
-    ? -B.accelSmooth * 0.006 - B.boostK * 0.1 + (throttle < 0 ? 0.07 : 0)
+    ? -B.accelSmooth * 0.006 - B.boostK * 0.1 + (throttle < 0 ? 0.07 : 0) + B.susp * 0.35
     : clamp(-B.vy * 0.024, -0.42, 0.32);
   B.pitch = lerp(B.pitch, pitchTarget, 1 - Math.exp(-6 * dt));
+  const wA = B.wheelie * 0.55;
   leanGroup.rotation.z = B.lean;
-  leanGroup.rotation.x = B.pitch;
+  leanGroup.rotation.x = B.pitch - wA;
+  // wheelie pivots around the rear contact patch; suspension compresses the body
+  leanGroup.position.set(0,
+    0.34 * (1 - Math.cos(wA)) + 0.78 * Math.sin(wA) - (B.susp + squat) * 0.22,
+    -0.78 * (1 - Math.cos(wA)) + 0.34 * Math.sin(wA));
   B.wheelRot += B.speed / 0.34 * dt;
   rearWheel.rotation.x = B.wheelRot;
   frontWheel.rotation.x = B.wheelRot;
   forkGroup.rotation.y = st * 0.3 * (1 - spdK * 0.6);
-  riderGroup.rotation.x = B.boostK * 0.2;
+  riderGroup.rotation.x = B.boostK * 0.2 + B.wheelie * 0.35;
 
-  // flames
+  // flames (white-hot during overdrive)
+  if (flames.length) flames[0].material.color.setHex(P.odT > 0 ? 0xffffff : 0x7df6ff);
   for (const fl of flames) {
     fl.visible = B.boostK > 0.15;
-    if (fl.visible) fl.scale.set(1, 1, 0.7 + B.boostK * (0.8 + Math.random() * 0.9));
+    if (fl.visible) {
+      const odS = 1 + P.odK * 0.6;
+      fl.scale.set(odS, odS, (0.7 + B.boostK * (0.8 + Math.random() * 0.9)) * (1 + P.odK * 0.8));
+    }
   }
   // backfire pops on throttle release
   if (prevW && !keys.w && B.speed > 40) backfireT = 0.35;
@@ -921,7 +1701,7 @@ function updateBike(dt) {
   tmpWorld.set(0, 0.55, -0.9).applyMatrix4(leanGroup.matrixWorld);
   const trailI = Math.max(B.boostK, B.drift ? 0.45 : 0) * clamp(B.speed / 20, 0, 1);
   trail.push(tmpWorld.x, tmpWorld.y, tmpWorld.z, trailI);
-  trail.mat.uniforms.uColor.value.setHex(B.boostK > 0.4 ? 0x5df3ff : 0xff5fb0);
+  trail.mat.uniforms.uColor.value.setHex(P.odT > 0 ? 0xffffff : B.boostK > 0.4 ? 0x5df3ff : 0xff5fb0);
   trail.update();
 }
 
@@ -942,7 +1722,7 @@ function updateCamera(dt) {
   const spdK = clamp(B.speed / 105, 0, 1);
   const camAngle = B.velAngle + B.driftOffset * 0.25;
   const dist = 6.2 + spdK * 3.4;
-  const height = 2.5 + spdK * 1.0 + clamp(B.y * 0.06, 0, 3);
+  const height = 2.5 + spdK * 1.0 + clamp(B.y * 0.06, 0, 3) - clamp(B.susp, -0.5, 1.5) * 1.1;
   const dx = Math.sin(camAngle), dz = Math.cos(camAngle);
   tmpV.set(B.x - dx * dist, B.y + height, B.z - dz * dist);
   const kxz = 1 - Math.exp(-9 * dt), ky = 1 - Math.exp(-5.5 * dt);
@@ -962,7 +1742,7 @@ function updateCamera(dt) {
   camLook.lerp(tmpV.set(B.x + dx * 7, B.y + 1.1, B.z + dz * 7), 1 - Math.exp(-11 * dt));
   camera.lookAt(camLook);
   camera.rotateZ(-B.lean * 0.22);
-  const fovT = 72 + spdK * 16 + B.boostK * 9;
+  const fovT = 72 + spdK * 16 + B.boostK * 9 + P.odK * 8;
   camera.fov = lerp(camera.fov, fovT, 1 - Math.exp(-5 * dt));
   camera.updateProjectionMatrix();
   shakeT = Math.max(0, shakeT - dt * 2.2);
@@ -997,6 +1777,9 @@ function resetBike() {
   }
   B.bikeYaw = B.velAngle; B.speed = 0; B.vy = 0; B.y = 0;
   B.drift = 0; B.driftOffset = 0; B.trickAccum = 0; B.grounded = true;
+  B.susp = 0; B.suspV = 0; B.wheelie = 0; B.wheelieT = 0;
+  B.lowGrip = 0; B.crashT = 0; B.safeT = 0;
+  B.lean = 0; B.leanV = 0; B.wobble = 0;
 }
 
 function handleMetaKeys(k, e) {
@@ -1009,7 +1792,20 @@ function handleMetaKeys(k, e) {
     else if (gameState === 'pause') resumeGame();
   }
   if (k === 'm') { Audio2.init(); Audio2.toggleMute(); popup(Audio2.muted ? 'MUTED' : 'SOUND ON', '#aaa', false); }
-  if (k === 'r' && gameState === 'play') { resetBike(); popup('RESET', '#aaa', false); }
+  if (k === 'r' && gameState === 'play') {
+    if (window.Race && Race.onReset()) return;
+    resetBike(); popup('RESET', '#aaa', false);
+  }
+  if (k === 'n') {
+    MAP.headingUp = !MAP.headingUp;
+    popup(MAP.headingUp ? 'MAP: HEADING UP' : 'MAP: NORTH UP', '#aaa', false);
+  }
+  if (k === 'l' && typeof cycleLighting === 'function') {
+    popup('LIGHTING: ' + cycleLighting().toUpperCase(), '#aaa', false);
+  }
+  if (k === 'p' && typeof POST !== 'undefined') {
+    popup(POST.toggle() ? 'POST FX ON' : 'POST FX OFF', '#aaa', false);
+  }
   if (gameState === 'title' && (k === 'space' || k === 'w')) startGame();
 }
 elOverlay.addEventListener('click', () => {
@@ -1059,21 +1855,44 @@ function frame(now) {
   if (gameState === 'play') {
     if (DEMO) keys.w = true;
     updateBike(dt);
+    updatePerks(dt);
     updateTraffic(dt);
+    if (window.Race) Race.update(dt);
+    if (window.Ghost) Ghost.update(dt);
     PSYS.update(dt);
     updateHUD(dt);
-    drawMinimap();
+    drawMinimap(dt);
     Audio2.update(Math.abs(B.speed), keys.w ? 1 : 0, B.boosting, !!B.drift, B.grounded);
   } else if (gameState === 'title') {
     updateTraffic(dt);
+    if (window.Race) Race.update(dt);
     PSYS.update(dt);
   }
   updateWorld(dt, elapsed, B.x, B.z);
   updateCamera(dt);
   updatePxScale();
-  drawFx(clamp(B.speed / 105, 0, 1), B.boostK);
+  drawFx(clamp(B.speed / 105, 0, 1), B.boostK + P.odK);
   for (const k in pressed) delete pressed[k];
-  renderer.render(scene, camera);
+
+  // post pipeline with an fps watchdog that falls back to direct rendering
+  if (typeof POST !== 'undefined') {
+    fpsAcc += dt; fpsN++;
+    if (fpsN >= 120) {
+      if (POST.isOn() && fpsAcc / fpsN > 0.026) {
+        POST.toggle();
+        popup('POST FX OFF (PERF)', '#aaa', false);
+      }
+      fpsAcc = 0; fpsN = 0;
+    }
+    const warp = gameState === 'play'
+      ? clamp(Math.abs(B.speed) / 105, 0, 1) * 0.45 + B.boostK * 0.4 + P.odK * 0.65
+      : 0;
+    POST.render(warp);
+  } else {
+    renderer.render(scene, camera);
+  }
 }
+let fpsAcc = 0, fpsN = 0;
 updatePxScale();
+updatePerkHUD();
 requestAnimationFrame(frame);

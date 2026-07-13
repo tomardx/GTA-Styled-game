@@ -27,8 +27,37 @@
   #combowrap { width: 130px; height: 5px; background: rgba(255,255,255,.12); border-radius: 3px; margin-top: 4px; }
   #combobar { height: 100%; background: linear-gradient(90deg, #ffe14d, #ff9a00); border-radius: 3px; width: 100%; }
 
-  #map { position: absolute; top: 18px; right: 22px; border-radius: 10px;
+  #map { position: absolute; top: 18px; right: 22px; border-radius: 50%;
     box-shadow: 0 0 0 2px rgba(255,45,149,.35), 0 0 24px rgba(255,45,149,.25); opacity: .92; }
+
+  #board { position: absolute; top: 198px; right: 22px; width: 138px; display: none;
+    background: rgba(10,5,20,.55); border-radius: 8px; padding: 6px 9px;
+    font-size: 12px; font-weight: 800; letter-spacing: 1px; color: #ddd; }
+  #board .row { display: flex; justify-content: space-between; padding: 2.5px 0; }
+  #board .row .gap { color: rgba(255,255,255,.45); font-weight: 600; }
+
+  #racehud { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    display: none; text-align: center; }
+  #racepos { font-size: 42px; font-weight: 900; font-style: italic; color: #fff;
+    text-shadow: 0 0 16px #00e5ff, 0 0 46px rgba(0,229,255,.5); line-height: 1; }
+  #racelap { font-size: 13px; font-weight: 800; letter-spacing: 3px; color: #9fe8ff; margin-top: 3px; }
+  #racetime { font-size: 15px; font-weight: 800; letter-spacing: 2px; color: #ffe14d;
+    text-shadow: 0 0 10px rgba(255,225,77,.6); margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+  #perkslot { position: absolute; right: 296px; bottom: 24px; width: 96px; text-align: center;
+    border: 2px solid rgba(255,255,255,.22); border-radius: 12px; padding: 9px 6px 7px;
+    background: rgba(10,5,20,.55); color: #777; }
+  #perkslot.held { animation: perkpulse 1s infinite alternate; }
+  @keyframes perkpulse { from { box-shadow: 0 0 6px currentColor; } to { box-shadow: 0 0 24px currentColor; } }
+  #perkglyph { font-size: 30px; font-weight: 900; line-height: 1; }
+  #perkname { font-size: 9.5px; font-weight: 800; letter-spacing: 1px; margin-top: 5px; }
+  #perkkey { margin-top: 4px; font-size: 10px; font-weight: 800; color: rgba(255,255,255,.45); letter-spacing: 2px; }
+
+  #ghostbtns { margin-top: 32px; display: none; gap: 14px; }
+  #ghostbtns button { pointer-events: auto; cursor: pointer; background: rgba(0,229,255,.08);
+    color: #7fdcff; border: 1px solid rgba(0,229,255,.5); border-radius: 8px; padding: 9px 18px;
+    font-family: inherit; font-size: 12px; font-weight: 800; letter-spacing: 2px; }
+  #ghostbtns button:hover { background: rgba(0,229,255,.25); color: #fff; }
 
   #speedo { position: absolute; right: 26px; bottom: 24px; text-align: right; }
   #spd { font-size: 74px; font-weight: 900; font-style: italic; color: #fff; line-height: .9;
@@ -105,16 +134,27 @@
     <div id="combo"><span>x2 COMBO</span><div id="combowrap"><div id="combobar"></div></div></div>
   </div>
   <canvas id="map" width="170" height="170"></canvas>
+  <div id="board"></div>
+  <div id="racehud">
+    <div id="racepos">P1</div>
+    <div id="racelap">LAP 1/2</div>
+    <div id="racetime">0:00.0</div>
+  </div>
   <div id="speedo">
     <span id="spd">0</span><span class="unit">KM/H</span>
     <div id="boostwrap"><div id="boostbar"></div></div>
     <div id="boostlabel">NITRO — DRIFT &amp; STUNT TO REFILL</div>
   </div>
+  <div id="perkslot">
+    <div id="perkglyph">—</div>
+    <div id="perkname">NO PERK</div>
+    <div id="perkkey">F</div>
+  </div>
   <div id="popups"></div>
   <div id="hint">
-    <b>W A S D</b> ride &nbsp;·&nbsp; <b>SHIFT</b> nitro &nbsp;·&nbsp; <b>SPACE</b> bunny hop<br>
+    <b>W A S D</b> ride &nbsp;·&nbsp; <b>SHIFT</b> nitro &nbsp;·&nbsp; <b>SPACE</b> bunny hop &nbsp;·&nbsp; <b>F</b> fire perk<br>
     <b>Q / E</b> hold to drift — release for boost &nbsp;·&nbsp; <b>Q / E in air</b> spin tricks<br>
-    hit ramps · thread rings · graze traffic · chain combos
+    grab perk orbs · ride into a race gate to challenge rivals · find the rooftop stunt zone
   </div>
 </div>
 
@@ -127,13 +167,21 @@
     <div class="k">SHIFT</div><div>nitro boost</div>
     <div class="k">SPACE</div><div>bunny hop</div>
     <div class="k">Q / E</div><div>drift (hold &amp; release) — spin tricks in the air</div>
+    <div class="k">F</div><div>fire held perk — collect glowing perk orbs</div>
+    <div class="k">N / L / P</div><div>map mode · lighting · post fx</div>
   </div>
   <div id="ovsub">CLICK OR PRESS <b>ENTER</b> TO RIDE</div>
+  <div id="ghostbtns">
+    <button id="gexp">EXPORT GHOST</button>
+    <button id="gimp">IMPORT GHOST</button>
+  </div>
   <div id="ovfoot">M — mute &nbsp;·&nbsp; R — reset bike &nbsp;·&nbsp; ESC — pause</div>
 </div>
 
 <script src="three.min.js"></script>
 <script src="world.js"></script>
 <script src="game.js"></script>
+<script src="race.js"></script>
+<script src="ghost.js"></script>
 </body>
 </html>
