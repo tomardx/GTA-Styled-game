@@ -411,6 +411,7 @@ function makePointsMaterial(tex) {
   return new THREE.ShaderMaterial({
     uniforms: { uTex: { value: tex }, uPxScale: { value: 1 } },
     vertexShader: [
+      'uniform float uPxScale;',
       'attribute vec3 aColor; attribute float aSize; attribute float aAlpha;',
       'varying vec3 vColor; varying float vAlpha;',
       'void main(){',
